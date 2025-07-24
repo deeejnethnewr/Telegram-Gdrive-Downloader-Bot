@@ -1,0 +1,5 @@
+pyrogram==2.0.36
+tgcrypto
+youtube_dl==2021.12.17
+gdown
+python-dotenv
