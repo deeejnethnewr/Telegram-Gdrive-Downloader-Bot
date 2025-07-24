@@ -1,82 +1,104 @@
 import os
-import re
+import configparser
 import logging
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from pyrogram import Client, filters
+from youtube_dl import YoutubeDL
 import gdown
 
-# Telegram Bot Token එක මෙතන දැමුව යුතුයි
-TELEGRAM_BOT_TOKEN = "8371050656:AAHOWlKI_bYINDx78jmBvnt6r19ah32spCY"
-
-# Logger සැකසීම
+# ─── Logging Setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Google Drive link එකෙන් file id එක හොයාගන්න regex
-GDRIVE_REGEX = r'https?://drive\.google\.com/(?:file/d/|open\?id=|uc\?id=)([\w-]+)'
+# ─── Config Load ───────────────────────────────────────────────────────────────
+config = configparser.ConfigParser()
+config.read("config.ini")
 
-# Download වෙන්න ඇති folder එක
-DOWNLOAD_FOLDER = 'downloads'
-if not os.path.exists(DOWNLOAD_FOLDER):
-    os.makedirs(DOWNLOAD_FOLDER)
+API_ID = config.getint("telegram", "api_id")
+API_HASH = config.get("telegram", "api_hash")
+BOT_TOKEN = config.get("telegram", "bot_token")
 
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "👋 හෙලෝ! Google Drive link එකක් එවන්න. මම ඒ file එක download කරලා, local එකට save කරලා ඔබට එවන්නම්."
-    )
+DOWNLOAD_FOLDER = config.get("storage", "download_folder", fallback="downloads")
+os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-def download_file(file_id: str):
-    url = f'https://drive.google.com/uc?id={file_id}'
-    output_path = os.path.join(DOWNLOAD_FOLDER, file_id)
-    return gdown.download(url, output_path, quiet=True)
+# ─── Pyrogram Client Init ─────────────────────────────────────────────────────
+bot = Client(
+    "downloader_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-def handle_message(update: Update, context: CallbackContext):
-    text = update.message.text or ""
-    match = re.search(GDRIVE_REGEX, text)
-    if not match:
-        update.message.reply_text("❌ හරි Google Drive link එකක් නොමැත. කරුණාකර හරි link එකක් එවන්න.")
-        return
-    
-    file_id = match.group(1)
-    update.message.reply_text(f"⏳ Downloading file (ID: {file_id})...")
-    
+# ─── Utility: Google Drive Download ───────────────────────────────────────────
+def download_drive(url, output_dir):
     try:
-        file_path = download_file(file_id)
-        if not file_path or not os.path.isfile(file_path):
-            update.message.reply_text("❌ Download වුනත් file එක සර්වරයේ නොමැත.")
-            return
+        filepath = gdown.download(url, output=output_dir, quiet=False)
+        return filepath
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        update.message.reply_text("❌ Download කිරීම අසමත් විය. කරුණාකර link එක පරීක්ෂා කරන්න.")
-        return
-    
-    update.message.reply_text(f"✅ Download සාර්ථකයි! File එක මේ තැන save වුනා: {file_path}\nFile එක ඔබට යවමින් පවතී...")
-    
+        logger.error(f"Drive download error: {e}")
+        return None
+
+# ─── Utility: Generic downloader via youtube_dl ───────────────────────────────
+def download_generic(url, output_dir):
+    ydl_opts = {
+        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "format": "best",
+    }
     try:
-        with open(file_path, 'rb') as f:
-            update.message.reply_document(document=f, filename=os.path.basename(file_path))
-        update.message.reply_text("📤 File එක සාර්ථකව යවා ඇත!")
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename
+    except Exception as e:
+        logger.error(f"Generic download error: {e}")
+        return None
+
+# ─── /download Command Handler ─────────────────────────────────────────────────
+@bot.on_message(filters.command("download") & filters.private)
+async def cmd_download(client, message):
+    if len(message.command) < 2:
+        await message.reply_text("▶️ Use: /download <link>")
+        return
+
+    url = message.command[1]
+    await message.reply_text(f"🔍 Downloading: {url}")
+
+    # Prepare per-user folder
+    folder = os.path.join(DOWNLOAD_FOLDER, str(message.from_user.id))
+    os.makedirs(folder, exist_ok=True)
+
+    # Choose downloader
+    if "drive.google.com" in url:
+        filepath = download_drive(url, folder)
+    else:
+        filepath = download_generic(url, folder)
+
+    if not filepath or not os.path.exists(filepath):
+        await message.reply_text("❌ Download failed.")
+        return
+
+    # Send file back
+    try:
+        await message.reply_document(
+            document=filepath,
+            caption=f"✅ Done: `{os.path.basename(filepath)}`"
+        )
     except Exception as e:
         logger.error(f"Send error: {e}")
-        update.message.reply_text("❌ File එක යවන්න බැරි විය. ඔබ local folder එකේ ගොනුව ලබා ගත හැක.")
+        await message.reply_text("❌ Could not send file.")
+    finally:
+        try:
+            os.remove(filepath)
+        except:
+            pass
 
-def error_handler(update: object, context: CallbackContext):
-    logger.warning(f'Update {update} caused error {context.error}')
+# ─── Bot Start-up ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    logger.info("Bot is up and running...")
+    bot.run()
 
-def main():
-    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-    dp.add_error_handler(error_handler)
-    
-    logger.info("Bot started. Listening for messages...")
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == '__main__':
-    main()
